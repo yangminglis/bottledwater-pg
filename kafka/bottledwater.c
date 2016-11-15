@@ -22,6 +22,9 @@
 #define DEFAULT_BROKER_LIST "localhost:9092"
 #define DEFAULT_SCHEMA_REGISTRY "http://localhost:8081"
 
+#define DEFAULT_SCHEMA_PATTERN "%%"
+#define DEFAULT_TABLE_PATTERN "%%"
+
 #define TABLE_NAME_BUFFER_LENGTH 128
 
 #define check(err, call) { err = call; if (err) return err; }
@@ -194,6 +197,18 @@ void usage(int exit_status) {
             "  -e, --on-error=[log|exit]   (default: %s)\n"
             "                          What to do in case of a transient error, such as\n"
             "                          failure to publish to Kafka.\n"
+            "  -o, --schemas=schema1|schema2  (default: all schemas)\n"
+            "                          Pattern specifying which schemas to stream.  If this\n"
+            "                          is not specified, all schemas will be selected.\n"
+            "                          The pattern syntax is as per the SQL\n"
+            "                          `SIMILAR TO` operator: see\n"
+            "         https://www.postgresql.org/docs/current/static/functions-matching.html\n"
+            "  -i, --tables=table1|table2   (default: all tables)\n"
+            "                          Pattern specifying which tables to stream.  If this\n"
+            "                          is not specified, all tables in the selected schemas\n"
+            "                          will be streamed.  The pattern syntax is as per the\n"
+            "                          SQL `SIMILAR TO` operator: see\n"
+            "         https://www.postgresql.org/docs/current/static/functions-matching.html\n"
             "  -x, --skip-snapshot     Skip taking a consistent snapshot of the existing\n"
             "                          database contents and just start streaming any new\n"
             "                          updates.  (Ignored if the replication slot already\n"
@@ -229,6 +244,8 @@ void parse_options(producer_context_t context, int argc, char **argv) {
         {"allow-unkeyed",   no_argument,       NULL, 'u'},
         {"topic-prefix",    required_argument, NULL, 'p'},
         {"on-error",        required_argument, NULL, 'e'},
+        {"schemas",         required_argument, NULL, 'o'},
+        {"tables",          required_argument, NULL, 'i'},
         {"skip-snapshot",   no_argument,       NULL, 'x'},
         {"kafka-config",    required_argument, NULL, 'C'},
         {"topic-config",    required_argument, NULL, 'T'},
@@ -277,6 +294,12 @@ void parse_options(producer_context_t context, int argc, char **argv) {
                 break;
             case 'T':
                 set_topic_config(context, optarg, parse_config_option(optarg));
+                break;
+            case 'i':
+                context->client->table_pattern = strdup(optarg);
+                break;
+            case 'o':
+                context->client->schema_pattern = strdup(optarg);
                 break;
             case 1:
                 rd_kafka_conf_properties_show(stderr);
@@ -757,6 +780,9 @@ client_context_t init_client() {
     client->repl.slot_name = strdup(DEFAULT_REPLICATION_SLOT);
     client->repl.output_plugin = strdup(OUTPUT_PLUGIN);
     client->repl.frame_reader = frame_reader;
+    client->schema_pattern = strdup(DEFAULT_SCHEMA_PATTERN);
+    client->table_pattern = strdup(DEFAULT_TABLE_PATTERN);
+    client->repl.table_ids = strdup(DEFAULT_TABLE_PATTERN);
     return client;
 }
 

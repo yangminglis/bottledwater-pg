@@ -41,7 +41,7 @@ typedef struct {
 } export_state;
 
 void print_tupdesc(char *title, TupleDesc tupdesc);
-void get_table_list(export_state *state, text *table_pattern, bool allow_unkeyed);
+void get_table_list(export_state *state, text *table_pattern, text *schema_pattern, bool allow_unkeyed);
 void open_next_table(export_state *state);
 void close_current_table(export_state *state);
 bytea *format_snapshot_row(export_state *state);
@@ -106,6 +106,7 @@ Datum bottledwater_export(PG_FUNCTION_ARGS) {
     export_state *state;
     int ret;
     text *table_pattern;
+    text *schema_pattern;
     bool allow_unkeyed;
     bytea *result;
 
@@ -140,10 +141,11 @@ Datum bottledwater_export(PG_FUNCTION_ARGS) {
         funcctx->user_fctx = state;
 
         table_pattern = PG_GETARG_TEXT_P(0);
-        allow_unkeyed = PG_GETARG_BOOL(1);
-        state->error_policy = parse_error_policy(TextDatumGetCString(PG_GETARG_TEXT_P(2)));
+	schema_pattern = PG_GETARG_TEXT_P(1);
+        allow_unkeyed = PG_GETARG_BOOL(2);
+        state->error_policy = parse_error_policy(TextDatumGetCString(PG_GETARG_TEXT_P(3)));
 
-        get_table_list(state, table_pattern, allow_unkeyed);
+        get_table_list(state, table_pattern, schema_pattern, allow_unkeyed);
         if (state->num_tables > 0) open_next_table(state);
     }
 
@@ -188,7 +190,7 @@ Datum bottledwater_export(PG_FUNCTION_ARGS) {
     SRF_RETURN_DONE(funcctx);
 }
 
-/* Queries the PG catalog to get a list of tables (matching the given table name pattern)
+/* Queries the PG catalog to get a list of tables (matching the given table name pattern and schema pattern)
  * that we should export. The pattern is given to the LIKE operator, so "%" means any
  * table. Selects only ordinary tables (no views, foreign tables, etc) and excludes any
  * PG system tables. Updates export_state with the list of tables.
@@ -196,9 +198,9 @@ Datum bottledwater_export(PG_FUNCTION_ARGS) {
  * Also takes a shared lock on all the tables we're going to export, to make sure they
  * aren't dropped or schema-altered before we get around to reading them. (Ordinary
  * writes to the table, i.e. insert/update/delete, are not affected.) */
-void get_table_list(export_state *state, text *table_pattern, bool allow_unkeyed) {
-    Oid argtypes[] = { TEXTOID };
-    Datum args[] = { PointerGetDatum(table_pattern) };
+void get_table_list(export_state *state, text *table_pattern, text *schema_pattern, bool allow_unkeyed) {
+    Oid argtypes[] = { TEXTOID, TEXTOID };
+    Datum args[] = { PointerGetDatum(table_pattern), PointerGetDatum(schema_pattern) };
     StringInfoData errors;
 
     int ret = SPI_execute_with_args(
@@ -222,11 +224,11 @@ void get_table_list(export_state *state, text *table_pattern, bool allow_unkeyed
             "LEFT JOIN pg_catalog.pg_class ic ON i.indexrelid = ic.oid "
 
             // Select only ordinary tables ('r' == RELKIND_RELATION) matching the required name pattern
-            "WHERE c.relkind = 'r' AND c.relname LIKE $1 AND "
-            "n.nspname NOT LIKE 'pg_%' AND n.nspname != 'information_schema' AND " // not a system table
+            "WHERE c.relkind = 'r' AND c.relname SIMILAR TO $1 AND "
+            "n.nspname NOT LIKE 'pg_%' AND n.nspname != 'information_schema' AND n.nspname SIMILAR TO $2 AND " // not a system table
             "c.relpersistence = 'p'", // 'p' == RELPERSISTENCE_PERMANENT (not unlogged or temporary)
 
-            1, argtypes, args, NULL, true, 0);
+            2, argtypes, args, NULL, true, 0);
 
     if (ret != SPI_OK_SELECT) {
         elog(ERROR, "Could not fetch table list: SPI_execute_with_args returned %d", ret);

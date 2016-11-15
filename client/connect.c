@@ -31,6 +31,7 @@ int snapshot_start(client_context_t context);
 int snapshot_poll(client_context_t context);
 int snapshot_tuple(client_context_t context, PGresult *res, int row_number);
 
+int lookup_table_oids(client_context_t context);
 
 /* Allocates a client_context struct. After this is done and before
  * db_client_start() is called, various fields in the struct need to be
@@ -46,6 +47,9 @@ client_context_t db_client_new() {
 void db_client_free(client_context_t context) {
     client_sql_disconnect(context);
     if (context->repl.conn) PQfinish(context->repl.conn);
+    if (context->table_pattern) free(context->table_pattern);
+    if (context->schema_pattern) free(context->schema_pattern);
+    if (context->repl.table_ids) free(context->repl.table_ids);
     if (context->repl.snapshot_name) free(context->repl.snapshot_name);
     if (context->repl.output_plugin) free(context->repl.output_plugin);
     if (context->repl.slot_name) free(context->repl.slot_name);
@@ -72,6 +76,9 @@ int db_client_start(client_context_t context) {
 
     check(err, client_connect(context));
     checkRepl(err, context, replication_stream_check(&context->repl));
+    // Get list table oids from context schema_pattern and table_pattern
+    check(err, lookup_table_oids(context));
+
     check(err, replication_slot_exists(context, &slot_exists));
 
     if (slot_exists) {
@@ -333,16 +340,15 @@ int snapshot_start(client_context_t context) {
     check(err, exec_sql(context, query->data));
     destroyPQExpBuffer(query);
 
-    Oid argtypes[] = { 25, 16, 25 }; // 25 == TEXTOID, 16 == BOOLOID
-    const char *args[] = {
-        "%",
-        context->allow_unkeyed ? "t" : "f",
-        context->error_policy
-    };
+    Oid argtypes[] = { 25, 25, 16, 25 }; // 25 == TEXTOID, 16 == BOOLOID
+    const char *args[] = { context->table_pattern,
+                           context->schema_pattern,
+                           context->allow_unkeyed ? "t" : "f",
+			    context->error_policy};
 
     if (!PQsendQueryParams(context->sql_conn,
-                "SELECT bottledwater_export(table_pattern := $1, allow_unkeyed := $2, error_policy := $3)",
-                3, argtypes, args, NULL, NULL, 1)) { // The final 1 requests results in binary format
+        "SELECT bottledwater_export(table_pattern := $1, schema_pattern := $2, allow_unkeyed := $3, error_policy := $4)",
+                4, argtypes, args, NULL, NULL, 1)) { // The final 1 requests results in binary format
         client_error(context, "Could not dispatch snapshot fetch: %s",
                 PQerrorMessage(context->sql_conn));
         return EIO;
@@ -421,4 +427,71 @@ int snapshot_tuple(client_context_t context, PGresult *res, int row_number) {
         client_error(context, "Error parsing frame data: %s", context->repl.frame_reader->error);
     }
     return err;
+}
+
+/* Lookup for table oids from schema_pattern and table_pattern
+   If schema_pattern == % and table_pattern == % then BW will get all tables in db */
+int lookup_table_oids(client_context_t context) {
+
+    if (strcmp(context->table_pattern, "%%") == 0 && strcmp(context->schema_pattern, "%%") == 0) {
+        // All tables will be streamed
+        return 0;
+    }
+
+    PQExpBuffer query = createPQExpBuffer();
+    appendPQExpBuffer(query,
+          "SELECT c.oid"
+          " FROM pg_catalog.pg_class c"
+          " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+          " WHERE c.relkind = 'r' AND"
+          " c.relname SIMILAR TO '%s' AND" // get table that has name similar to table_pattern
+                                           // pattern syntax follows
+                                           // https://www.postgresql.org/docs/current/static/functions-matching.html
+          " n.nspname NOT LIKE 'pg_%%' AND n.nspname != 'information_schema' AND"
+          " n.nspname SIMILAR TO '%s' AND" // only get table has schema similar to schema_pattern
+                                           // pattern syntax follows
+                                           // https://www.postgresql.org/docs/current/static/functions-matching.html
+          " c.relpersistence = 'p'",
+        context->table_pattern,
+        context->schema_pattern);
+
+    PGresult *res = PQexec(context->sql_conn, query->data);
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        client_error(context, "Failed to lookup table ids: %s.", PQerrorMessage(context->sql_conn));
+        PQclear(res);
+        return EIO;
+    }
+
+    // Query returns zero row, mean there's no tables match with table_pattern and schema_pattern
+    if (PQntuples(res) == 0) {
+        client_error(context, "Couldn't find any tables matching: schemas %s, tables %s.",
+                    context->schema_pattern, context->table_pattern);
+        PQclear(res);
+        return EIO;
+    }
+
+    // Query returns zero field, it means there something wrong with the query :D
+    if (PQnfields(res) == 0) {
+        client_error(context, "Unexpected result when looking up table ids with (table_schema %s, schema_pattern %s).",
+                context->table_pattern, context->schema_pattern);
+        PQclear(res);
+        return EIO;
+    }
+
+    int i;
+    int rows = PQntuples(res);
+    PQExpBuffer table_ids = createPQExpBuffer();
+
+    appendPQExpBuffer(table_ids, "%s", rows > 0 ? PQgetvalue(res, 0, 0): "");
+    for (i = 1; i < rows; ++i) {
+        appendPQExpBuffer(table_ids, ".");
+        appendPQExpBuffer(table_ids, "%s", PQgetvalue(res, i, 0) ? PQgetvalue(res, i, 0) : "");
+    }
+    context->repl.table_ids = strdup(table_ids->data);
+
+    PQclear(res);
+    destroyPQExpBuffer(query);
+    destroyPQExpBuffer(table_ids);
+    return 0;
 }
